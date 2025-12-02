@@ -1,0 +1,29 @@
+{
+  "name": "qbert-devvit",
+  "version": "0.0.1",
+  "description": "Discord notification bot for Reddit moderation queues - Devvit Edition",
+  "type": "module",
+  "main": "src/main.ts",
+  "scripts": {
+    "dev": "devvit playtest",
+    "build": "devvit build",
+    "upload": "devvit upload"
+  },
+  "dependencies": {
+    "@devvit/public-api": "latest"
+  },
+  "devDependencies": {
+    "@devvit/tsconfig": "latest",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "devvit",
+    "reddit",
+    "discord",
+    "moderation",
+    "webhook"
+  ],
+  "author": "",
+  "license": "MIT"
+}
+
