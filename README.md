@@ -6,7 +6,7 @@ A Reddit Devvit application that monitors subreddit moderation queues and sends 
 
 QBert-Devvit is a native Reddit application built on the [Devvit platform](https://developers.reddit.com/docs/) that bridges Reddit moderation workflows with Discord. When items enter your subreddit's moderation queue, moderators receive instant Discord notifications with details about the pending content.
 
-This project is a reimplementation of [QBert](../QBert) (originally a .NET application) as a Devvit app, eliminating the need for self-hosting while gaining native Reddit API access.
+This project is a reimplementation of [QBert](https://github.com/GoddessOfTest/qbert) (originally a .NET application) as a Devvit app, eliminating the need for self-hosting while gaining native Reddit API access.
 
 ## Features
 
@@ -98,7 +98,7 @@ See [LICENSE](LICENSE) for details.
 
 ## Related
 
-- [Original QBert (.NET)](../QBert) — The original implementation
+- [Original QBert (.NET)](https://github.com/GoddessOfTest/qbert) — The original implementation
 - [Discord Relay](https://developers.reddit.com/apps/discord-relay) — Similar Devvit app for reference
 - [Devvit Mod Tools Guide](https://developers.reddit.com/docs/introduction/intro-mod-tools)
 
