@@ -30,11 +30,19 @@ Devvit.addSettings([
       },
       {
         name: 'checkIntervalMinutes',
-        label: 'Check Interval (minutes)',
+        label: 'Backup Check Interval (minutes)',
         type: 'number',
         scope: 'installation',
-        defaultValue: 15,
-        helpText: 'How often to check the mod queue (1-60 minutes)',
+        defaultValue: 30,
+        helpText: 'Backup scheduler interval for catching missed items (default: 30, range: 15-60)',
+      },
+      {
+        name: 'batchFlushIntervalSeconds',
+        label: 'Notification Batch Interval (seconds)',
+        type: 'number',
+        scope: 'installation',
+        defaultValue: 30,
+        helpText: 'How often to flush batched notifications (default: 30, range: 15-120)',
       },
     ],
   },
@@ -172,6 +180,35 @@ const DiscordColors = {
 
 /*
  * =============================================================================
+ * REDIS KEYS
+ * =============================================================================
+ */
+
+const RedisKeys = {
+  PROCESSED_PREFIX: 'processed:',
+  POST_TITLE_PREFIX: 'post_title:',
+  NOTIFICATION_QUEUE: 'notification_queue',
+  CACHED_GIF: 'cached_gif',
+  LAST_CHECK: 'last_check',
+  LAST_OVERFLOW_ALERT: 'last_overflow_alert',
+} as const;
+
+/*
+ * =============================================================================
+ * CACHE TTLs (in milliseconds)
+ * =============================================================================
+ */
+
+const CacheTTL = {
+  PROCESSED_ITEM: 24 * 60 * 60 * 1000,    // 24 hours
+  POST_TITLE: 60 * 60 * 1000,              // 1 hour
+  GIF: 5 * 60 * 1000,                      // 5 minutes
+  NOTIFICATION_QUEUE: 10 * 60 * 1000,      // 10 minutes (safety TTL)
+  OVERFLOW_COOLDOWN: 60 * 60 * 1000,       // 1 hour
+} as const;
+
+/*
+ * =============================================================================
  * TYPES
  * =============================================================================
  */
@@ -182,13 +219,13 @@ interface DiscordEmbed {
   url?: string;
   color: number;
   timestamp: string;
-  thumbnail?: { url: string };  // Thumbnail is cleaner than full-size image
+  thumbnail?: { url: string };
   image?: { url: string };
 }
 
 interface DiscordWebhookPayload {
-  username?: string;     // Custom bot name
-  avatar_url?: string;   // Custom bot avatar
+  username?: string;
+  avatar_url?: string;
   content?: string;
   embeds: DiscordEmbed[];
 }
@@ -197,7 +234,7 @@ interface DiscordWebhookPayload {
 const DISCORD_BOT_USERNAME = 'QBert';
 const DISCORD_BOT_AVATAR = 'https://i.imgur.com/n4wnIEU.png';
 
-// Slack Block Kit types (following BanBunny pattern)
+// Slack Block Kit types
 interface SlackBlock {
   type: string;
   text?: {
@@ -233,7 +270,19 @@ interface ModQueueItemData {
   url: string;
   createdAt: Date;
   isStale: boolean;
-  parentPostTitle?: string;  // For comments only
+  parentPostTitle?: string;
+}
+
+// Serializable version for Redis queue storage
+interface SerializedModQueueItemData {
+  id: string;
+  type: 'submission' | 'comment';
+  title: string;
+  author: string;
+  url: string;
+  createdAt: string;  // ISO string
+  isStale: boolean;
+  parentPostTitle?: string;
 }
 
 interface OverflowAlertData {
@@ -241,41 +290,152 @@ interface OverflowAlertData {
   discordRoleId?: string;
 }
 
+// Settings interface for notification configuration
+interface NotificationSettings {
+  enableDiscord: boolean;
+  discordWebhookUrl?: string;
+  discordRoleId?: string;
+  enableSlack: boolean;
+  slackWebhookUrl?: string;
+}
+
 /*
  * =============================================================================
- * SCHEDULER JOB
+ * EVENT-DRIVEN TRIGGERS: Automod filter events for near-instant detection
+ * =============================================================================
+ * Note: Devvit provides AutomoderatorFilterPost and AutomoderatorFilterComment
+ * triggers that fire when items are filtered into the mod queue.
+ */
+
+Devvit.addTrigger({
+  event: 'AutomoderatorFilterPost',
+  onEvent: async (event, context: TriggerContext) => {
+    try {
+      console.log('QBert: AutomoderatorFilterPost triggered');
+
+      const settings = await context.settings.getAll();
+      const enableSubmissionNotifications = (settings.enableSubmissionNotifications as boolean) !== false;
+      
+      if (!enableSubmissionNotifications) return;
+
+      const post = event.post;
+      if (!post) {
+        console.warn('QBert: AutomoderatorFilterPost event missing post data');
+        return;
+      }
+
+      const targetId = post.id;
+      
+      // Check if already processed
+      if (await isItemProcessed(context, targetId)) {
+        console.log(`QBert: Post ${targetId} already processed, skipping`);
+        return;
+      }
+
+      const staleThresholdMinutes = (settings.staleThresholdMinutes as number) || 45;
+      const createdAt = post.createdAt ? new Date(post.createdAt) : new Date();
+      const isStale = isItemStale(createdAt, staleThresholdMinutes);
+
+      // Note: PostV2 from events uses authorId, not author string
+      const authorName = post.authorId ? `u/${post.authorId}` : 'Unknown';
+      
+      const itemData: ModQueueItemData = {
+        id: targetId,
+        type: 'submission',
+        title: post.title ?? 'Untitled',
+        author: authorName,
+        url: post.permalink ? `https://reddit.com${post.permalink}` : `https://reddit.com`,
+        createdAt,
+        isStale,
+      };
+
+      await queueNotification(context, itemData);
+      await markItemProcessed(context, targetId);
+      
+      console.log(`QBert: Queued notification for post ${targetId}`);
+    } catch (error) {
+      console.error('QBert: Error in AutomoderatorFilterPost trigger:', error);
+    }
+  },
+});
+
+Devvit.addTrigger({
+  event: 'AutomoderatorFilterComment',
+  onEvent: async (event, context: TriggerContext) => {
+    try {
+      console.log('QBert: AutomoderatorFilterComment triggered');
+
+      const settings = await context.settings.getAll();
+      const enableCommentNotifications = (settings.enableCommentNotifications as boolean) !== false;
+      
+      if (!enableCommentNotifications) return;
+
+      const comment = event.comment;
+      if (!comment) {
+        console.warn('QBert: AutomoderatorFilterComment event missing comment data');
+        return;
+      }
+
+      const targetId = comment.id;
+      
+      // Check if already processed
+      if (await isItemProcessed(context, targetId)) {
+        console.log(`QBert: Comment ${targetId} already processed, skipping`);
+        return;
+      }
+
+      const staleThresholdMinutes = (settings.staleThresholdMinutes as number) || 45;
+      const createdAt = comment.createdAt ? new Date(comment.createdAt) : new Date();
+      const isStale = isItemStale(createdAt, staleThresholdMinutes);
+      
+      // Get parent post title with caching
+      const parentPostTitle = await getCachedPostTitle(context, comment.postId ?? '');
+      
+      // Get author name from CommentV2
+      const authorName = comment.author ?? 'Unknown';
+
+      const itemData: ModQueueItemData = {
+        id: targetId,
+        type: 'comment',
+        title: parentPostTitle,
+        author: authorName,
+        url: comment.permalink ? `https://reddit.com${comment.permalink}` : `https://reddit.com`,
+        createdAt,
+        isStale,
+        parentPostTitle,
+      };
+
+      await queueNotification(context, itemData);
+      await markItemProcessed(context, targetId);
+      
+      console.log(`QBert: Queued notification for comment ${targetId}`);
+    } catch (error) {
+      console.error('QBert: Error in AutomoderatorFilterComment trigger:', error);
+    }
+  },
+});
+
+/*
+ * =============================================================================
+ * SCHEDULER JOB: Flush notification queue (batched delivery)
  * =============================================================================
  */
 
 Devvit.addSchedulerJob({
-  name: 'checkModQueue',
+  name: 'flushNotificationQueue',
   onRun: async (event, context) => {
     try {
-      console.log('QBert: Checking mod queue...');
+      console.log('QBert: Flushing notification queue...');
 
-      // Step 1: Load Configuration
+      // Load settings
       const settings = await context.settings.getAll();
       
-      // Discord settings
       const enableDiscordNotifications = (settings.enableDiscordNotifications as boolean) !== false;
       const discordWebhookUrl = settings.discordWebhookUrl as string | undefined;
       const discordRoleId = settings.discordRoleId as string | undefined;
-      
-      // Slack settings
       const enableSlackNotifications = (settings.enableSlackNotifications as boolean) === true;
       const slackWebhookUrl = settings.slackWebhookUrl as string | undefined;
-      
-      // Threshold settings
-      const staleThresholdMinutes = (settings.staleThresholdMinutes as number) || 45;
-      const overflowThreshold = (settings.overflowThreshold as number) || 5;
-      
-      // Notification toggle settings
-      const enableSubmissionNotifications = (settings.enableSubmissionNotifications as boolean) !== false;
-      const enableCommentNotifications = (settings.enableCommentNotifications as boolean) !== false;
-      const enableStaleAlerts = (settings.enableStaleAlerts as boolean) !== false;
-      const enableOverflowAlerts = (settings.enableOverflowAlerts as boolean) !== false;
 
-      // Build notification settings object for unified handling
       const notificationSettings: NotificationSettings = {
         enableDiscord: enableDiscordNotifications && !!discordWebhookUrl,
         discordWebhookUrl,
@@ -284,32 +444,85 @@ Devvit.addSchedulerJob({
         slackWebhookUrl,
       };
 
-      // Check if at least one notification platform is configured
       if (!notificationSettings.enableDiscord && !notificationSettings.enableSlack) {
-        console.log('QBert: No notification platforms configured or enabled');
+        console.log('QBert: No notification platforms configured');
         return;
       }
 
-      // Get subreddit name from event data
-      const subredditName = event.data?.subredditName as string | undefined;
-      if (!subredditName) {
-        console.error('QBert: Subreddit name not found in event data');
+      // Get all queued notifications
+      const queuedItems = await getQueuedNotifications(context);
+      
+      if (queuedItems.length === 0) {
+        console.log('QBert: No notifications in queue');
         return;
       }
 
-      // Step 2: Fetch Mod Queue
+      console.log(`QBert: Processing ${queuedItems.length} queued notifications`);
+
+      // Get cached GIF for the batch
+      const gifUrl = await getCachedGif(context);
+
+      // Send batched notifications
+      await sendBatchedNotifications(notificationSettings, queuedItems, gifUrl);
+
+      // Clear the queue
+      await clearNotificationQueue(context);
+
+      console.log(`QBert: Flushed ${queuedItems.length} notifications`);
+    } catch (error) {
+      console.error('QBert: Error flushing notification queue:', error);
+    }
+  },
+});
+
+/*
+ * =============================================================================
+ * SCHEDULER JOB: Backup mod queue check (fallback for missed events)
+ * =============================================================================
+ */
+
+Devvit.addSchedulerJob({
+  name: 'checkModQueue',
+  onRun: async (event, context) => {
+    try {
+      console.log('QBert: Running backup mod queue check...');
+
+      // Load settings
+      const settings = await context.settings.getAll();
+      
+      const enableDiscordNotifications = (settings.enableDiscordNotifications as boolean) !== false;
+      const discordWebhookUrl = settings.discordWebhookUrl as string | undefined;
+      const discordRoleId = settings.discordRoleId as string | undefined;
+      const enableSlackNotifications = (settings.enableSlackNotifications as boolean) === true;
+      const slackWebhookUrl = settings.slackWebhookUrl as string | undefined;
+      const staleThresholdMinutes = (settings.staleThresholdMinutes as number) || 45;
+      const overflowThreshold = (settings.overflowThreshold as number) || 5;
+      const enableSubmissionNotifications = (settings.enableSubmissionNotifications as boolean) !== false;
+      const enableCommentNotifications = (settings.enableCommentNotifications as boolean) !== false;
+      const enableStaleAlerts = (settings.enableStaleAlerts as boolean) !== false;
+      const enableOverflowAlerts = (settings.enableOverflowAlerts as boolean) !== false;
+
+      const notificationSettings: NotificationSettings = {
+        enableDiscord: enableDiscordNotifications && !!discordWebhookUrl,
+        discordWebhookUrl,
+        discordRoleId,
+        enableSlack: enableSlackNotifications && !!slackWebhookUrl,
+        slackWebhookUrl,
+      };
+
+      if (!notificationSettings.enableDiscord && !notificationSettings.enableSlack) {
+        console.log('QBert: No notification platforms configured');
+        return;
+      }
+
+      // Fetch mod queue
       let queueItems: (Post | Comment)[];
       try {
-        // Get the subreddit object first
         const subreddit = await context.reddit.getCurrentSubreddit();
-        
-        // Get mod queue from subreddit (returns a Listing)
         const modQueueListing = subreddit.getModQueue({ 
           type: 'all',
           limit: 100
         });
-        
-        // Convert Listing to array
         queueItems = await modQueueListing.all();
       } catch (error) {
         console.error('QBert: Error fetching mod queue:', error);
@@ -318,199 +531,140 @@ Devvit.addSchedulerJob({
 
       if (!queueItems || queueItems.length === 0) {
         console.log('QBert: Mod queue is empty');
-        try {
-          await context.redis.set('last_check', new Date().toISOString());
-        } catch (error) {
-          console.warn('QBert: Error updating last_check timestamp:', error);
-        }
+        await context.redis.set(RedisKeys.LAST_CHECK, new Date().toISOString());
         return;
       }
 
       const totalQueueCount = queueItems.length;
       console.log(`QBert: Found ${totalQueueCount} items in mod queue`);
 
-      // Step 3: Filter Processed Items and Process New Ones
-      let processedCount = 0;
-      let notificationCount = 0;
+      // Batch check which items are already processed
+      const itemIds = queueItems.map(item => item.id);
+      const processedStatus = await batchCheckProcessed(context, itemIds);
 
-      for (const item of queueItems) {
-        try {
+      // Filter to only unprocessed items
+      const unprocessedItems = queueItems.filter((_, index) => !processedStatus[index]);
+      
+      if (unprocessedItems.length === 0) {
+        console.log('QBert: All items already processed');
+      } else {
+        console.log(`QBert: Found ${unprocessedItems.length} unprocessed items`);
+
+        // Process unprocessed items
+        for (const item of unprocessedItems) {
+          // Get item ID early for error handling
           const itemId = item.id;
           
-          // Check if already processed
-          if (await isItemProcessed(context, itemId)) {
-            continue;
-          }
-
-          // Step 4: Classify Item (based on TypeScript type)
-          const isSubmission = item instanceof Post;
-          const isComment = item instanceof Comment;
-
-          if (!isSubmission && !isComment) {
-            console.warn(`QBert: Unknown item type for ${itemId}, skipping`);
-            await markItemProcessed(context, itemId);
-            continue;
-          }
-
-          // Get creation time from the item
-          const itemCreatedAt = item.createdAt;
-          const stale = isItemStale(itemCreatedAt, staleThresholdMinutes);
-
-          // Determine if we should send notification
-          let shouldNotify = false;
-          let shouldSendStaleAlert = false;
-
-          if (isSubmission) {
-            if (stale && enableStaleAlerts) {
-              shouldNotify = true;
-              shouldSendStaleAlert = true;
-            } else if (!stale && enableSubmissionNotifications) {
-              shouldNotify = true;
-            }
-          } else if (isComment) {
-            if (stale && enableStaleAlerts) {
-              shouldNotify = true;
-              shouldSendStaleAlert = true;
-            } else if (!stale && enableCommentNotifications) {
-              shouldNotify = true;
-            }
-          }
-
-          if (shouldNotify) {
-            // Build unified item data for notification
-            let itemData: ModQueueItemData;
-
-            if (isSubmission) {
-              const post = item as Post;
-              itemData = {
-                id: itemId,
-                type: 'submission',
-                title: post.title,
-                author: post.authorName ?? 'Unknown',
-                url: `https://reddit.com${post.permalink}`,
-                createdAt: itemCreatedAt,
-                isStale: shouldSendStaleAlert,
-              };
-            } else {
-              // Comment
-              const comment = item as Comment;
+          try {
+            // Process based on item type
+            if (item instanceof Post) {
+              const post = item;
+              const itemCreatedAt = post.createdAt;
+              const stale = isItemStale(itemCreatedAt, staleThresholdMinutes);
               
-              // Fetch parent post to get title
-              let parentPostTitle = 'Unknown Post';
-              try {
-                const parentPost = await context.reddit.getPostById(comment.postId);
-                parentPostTitle = parentPost.title;
-              } catch (error) {
-                console.warn(`QBert: Could not fetch parent post for comment ${itemId}:`, error);
+              let shouldNotify = false;
+              if (stale && enableStaleAlerts) shouldNotify = true;
+              else if (!stale && enableSubmissionNotifications) shouldNotify = true;
+
+              if (shouldNotify) {
+                const itemData: ModQueueItemData = {
+                  id: itemId,
+                  type: 'submission',
+                  title: post.title,
+                  author: post.authorName ?? 'Unknown',
+                  url: `https://reddit.com${post.permalink}`,
+                  createdAt: itemCreatedAt,
+                  isStale: stale,
+                };
+                await queueNotification(context, itemData);
               }
+            } else if (item instanceof Comment) {
+              const comment = item;
+              const itemCreatedAt = comment.createdAt;
+              const stale = isItemStale(itemCreatedAt, staleThresholdMinutes);
+              
+              let shouldNotify = false;
+              if (stale && enableStaleAlerts) shouldNotify = true;
+              else if (!stale && enableCommentNotifications) shouldNotify = true;
 
-              itemData = {
-                id: itemId,
-                type: 'comment',
-                title: parentPostTitle,  // For comments, title is the parent post title
-                author: comment.authorName ?? 'Unknown',
-                url: `https://reddit.com${comment.permalink}`,
-                createdAt: itemCreatedAt,
-                isStale: shouldSendStaleAlert,
-                parentPostTitle,
-              };
+              if (shouldNotify) {
+                const parentPostTitle = await getCachedPostTitle(context, comment.postId);
+                const itemData: ModQueueItemData = {
+                  id: itemId,
+                  type: 'comment',
+                  title: parentPostTitle,
+                  author: comment.authorName ?? 'Unknown',
+                  url: `https://reddit.com${comment.permalink}`,
+                  createdAt: itemCreatedAt,
+                  isStale: stale,
+                  parentPostTitle,
+                };
+                await queueNotification(context, itemData);
+              }
             }
 
-            // Send to all enabled platforms (Discord and/or Slack)
-            try {
-              await sendItemNotifications(context, notificationSettings, itemData);
-              notificationCount++;
-            } catch (error) {
-              console.error(`QBert: Error sending notification for item ${itemId}:`, error);
-              // Continue processing other items
-            }
+            await markItemProcessed(context, itemId);
+          } catch (error) {
+            console.error(`QBert: Error processing item ${itemId}:`, error);
           }
-
-          // Mark as processed regardless of notification status
-          await markItemProcessed(context, itemId);
-          processedCount++;
-        } catch (error) {
-          console.error(`QBert: Error processing item ${item.id}:`, error);
-          // Continue processing other items
         }
       }
 
-      // Step 5: Check Queue Overflow
+      // Check queue overflow
       if (enableOverflowAlerts && totalQueueCount > overflowThreshold) {
-        try {
-          // Check for cooldown (1 hour)
-          const lastOverflowAlert = await context.redis.get('last_overflow_alert');
-          const now = Date.now();
-          const oneHourAgo = now - (60 * 60 * 1000);
-
-          if (!lastOverflowAlert || parseInt(lastOverflowAlert, 10) < oneHourAgo) {
-            // Send overflow alert to all enabled platforms
-            const overflowData: OverflowAlertData = {
-              itemCount: totalQueueCount,
-              discordRoleId,
-            };
-
-            const success = await sendOverflowNotifications(notificationSettings, overflowData);
-            if (success) {
-              await context.redis.set('last_overflow_alert', now.toString(), { expiration: new Date(now + 3600000) });
-              console.log(`QBert: Sent overflow alert for ${totalQueueCount} items`);
-            }
-          }
-        } catch (error) {
-          console.error('QBert: Error sending overflow alert:', error);
-        }
+        await sendOverflowAlertIfNeeded(context, notificationSettings, totalQueueCount);
       }
 
-      // Update last check timestamp
-      try {
-        await context.redis.set('last_check', new Date().toISOString());
-      } catch (error) {
-        console.warn('QBert: Error updating last_check timestamp:', error);
-      }
-
-      console.log(`QBert: Processed ${processedCount} items, sent ${notificationCount} notifications`);
+      await context.redis.set(RedisKeys.LAST_CHECK, new Date().toISOString());
+      console.log('QBert: Backup check complete');
     } catch (error) {
       console.error('QBert: Fatal error in checkModQueue:', error);
-      // Don't throw - allow scheduler to continue
     }
   },
 });
 
 /*
  * =============================================================================
- * TRIGGER: Schedule job on app install
+ * TRIGGERS: App Install/Upgrade
  * =============================================================================
  */
 
-/**
- * Helper function to schedule or reschedule the mod queue check job
- */
-async function scheduleModQueueCheck(context: { reddit: Devvit.Context['reddit']; scheduler: Devvit.Context['scheduler']; settings: Devvit.Context['settings'] }): Promise<void> {
+async function scheduleJobs(context: { reddit: Devvit.Context['reddit']; scheduler: Devvit.Context['scheduler']; settings: Devvit.Context['settings'] }): Promise<void> {
   const settings = await context.settings.getAll();
-  const intervalMinutes = (settings.checkIntervalMinutes as number) || 15;
   
-  // Validate interval (must be between 1 and 60 minutes)
-  const validInterval = Math.max(1, Math.min(60, intervalMinutes));
+  // Backup check interval (longer interval since we have event-driven triggers)
+  const backupIntervalMinutes = Math.max(15, Math.min(60, (settings.checkIntervalMinutes as number) || 30));
   
-  // Get current subreddit name
+  // Batch flush interval
+  const batchFlushSeconds = Math.max(15, Math.min(120, (settings.batchFlushIntervalSeconds as number) || 30));
+  
   const subredditName = await context.reddit.getCurrentSubredditName();
   
-  // Cancel any existing jobs first
+  // Cancel existing jobs
   const existingJobs = await context.scheduler.listJobs();
   for (const job of existingJobs) {
-    if (job.name === 'checkModQueue') {
+    if (job.name === 'checkModQueue' || job.name === 'flushNotificationQueue') {
       await context.scheduler.cancelJob(job.id);
     }
   }
   
-  // Schedule the recurring job with subreddit name in data
+  // Schedule backup mod queue check (longer interval)
   await context.scheduler.runJob({
     name: 'checkModQueue',
-    cron: `*/${validInterval} * * * *`, // Every N minutes
-    data: { subredditName }, // Pass subreddit name to job
+    cron: `*/${backupIntervalMinutes} * * * *`,
+    data: { subredditName },
   });
   
-  console.log(`QBert: Scheduled mod queue checks for r/${subredditName} every ${validInterval} minutes.`);
+  // Schedule notification queue flush (shorter interval for batching)
+  await context.scheduler.runJob({
+    name: 'flushNotificationQueue',
+    cron: `*/${Math.ceil(batchFlushSeconds / 60)} * * * *`,
+    data: { subredditName },
+  });
+  
+  console.log(`QBert: Scheduled jobs for r/${subredditName}`);
+  console.log(`  - Backup queue check: every ${backupIntervalMinutes} minutes`);
+  console.log(`  - Notification flush: every ${Math.ceil(batchFlushSeconds / 60)} minutes`);
 }
 
 Devvit.addTrigger({
@@ -520,10 +674,9 @@ Devvit.addTrigger({
     console.log(`QBert installed on r/${subredditName ?? 'unknown'}!`);
     
     try {
-      await scheduleModQueueCheck(context);
+      await scheduleJobs(context);
     } catch (error) {
       console.error('QBert: Error during app installation:', error);
-      // Don't throw - allow installation to complete
     }
   },
 });
@@ -531,12 +684,11 @@ Devvit.addTrigger({
 Devvit.addTrigger({
   events: ['AppUpgrade'],
   onEvent: async (event, context) => {
-    // Use optional chaining for event properties (BanBunny pattern)
     const subredditName = event.subreddit?.name;
     console.log(`QBert upgraded on r/${subredditName ?? 'unknown'}!`);
     
     try {
-      await scheduleModQueueCheck(context);
+      await scheduleJobs(context);
     } catch (error) {
       console.error('QBert: Error during app upgrade:', error);
     }
@@ -545,7 +697,320 @@ Devvit.addTrigger({
 
 /*
  * =============================================================================
- * HELPER FUNCTIONS (TO BE IMPLEMENTED)
+ * NOTIFICATION QUEUE FUNCTIONS (Batching)
+ * =============================================================================
+ * Using zSet (sorted set) for the queue since Devvit Redis supports it.
+ * Score = timestamp for ordering, member = JSON serialized item
+ */
+
+/**
+ * Queue a notification for batched delivery
+ */
+async function queueNotification(
+  context: TriggerContext | Devvit.Context,
+  item: ModQueueItemData
+): Promise<void> {
+  const { redis } = context;
+  try {
+    const serialized: SerializedModQueueItemData = {
+      ...item,
+      createdAt: item.createdAt.toISOString(),
+    };
+    
+    // Use zSet with timestamp as score for ordering
+    await redis.zAdd(RedisKeys.NOTIFICATION_QUEUE, {
+      score: Date.now(),
+      member: JSON.stringify(serialized),
+    });
+  } catch (error) {
+    console.error('QBert: Error queueing notification:', error);
+  }
+}
+
+/**
+ * Get all queued notifications
+ */
+async function getQueuedNotifications(
+  context: TriggerContext | Devvit.Context
+): Promise<ModQueueItemData[]> {
+  const { redis } = context;
+  try {
+    // Get all items from the sorted set
+    const items = await redis.zRange(RedisKeys.NOTIFICATION_QUEUE, 0, -1);
+    return items.map((item: { member: string }) => {
+      const parsed: SerializedModQueueItemData = JSON.parse(item.member);
+      return {
+        ...parsed,
+        createdAt: new Date(parsed.createdAt),
+      };
+    });
+  } catch (error) {
+    console.error('QBert: Error getting queued notifications:', error);
+    return [];
+  }
+}
+
+/**
+ * Clear the notification queue
+ */
+async function clearNotificationQueue(
+  context: TriggerContext | Devvit.Context
+): Promise<void> {
+  const { redis } = context;
+  try {
+    await redis.del(RedisKeys.NOTIFICATION_QUEUE);
+  } catch (error) {
+    console.error('QBert: Error clearing notification queue:', error);
+  }
+}
+
+/*
+ * =============================================================================
+ * BATCHED NOTIFICATION DELIVERY
+ * =============================================================================
+ */
+
+/**
+ * Send batched notifications to all platforms
+ * Discord supports up to 10 embeds per message
+ */
+async function sendBatchedNotifications(
+  settings: NotificationSettings,
+  items: ModQueueItemData[],
+  gifUrl: string
+): Promise<void> {
+  const DISCORD_MAX_EMBEDS = 10;
+  
+  // Build embeds for all items
+  const discordEmbeds = items.map(item => buildDiscordItemEmbed(item, gifUrl));
+  
+  const notifications: Promise<boolean>[] = [];
+  
+  // Discord: Batch into groups of 10 embeds
+  if (settings.enableDiscord && settings.discordWebhookUrl) {
+    for (let i = 0; i < discordEmbeds.length; i += DISCORD_MAX_EMBEDS) {
+      const batch = discordEmbeds.slice(i, i + DISCORD_MAX_EMBEDS);
+      const payload: DiscordWebhookPayload = {
+        embeds: batch,
+      };
+      notifications.push(
+        sendDiscordNotification(settings.discordWebhookUrl, payload)
+          .then(success => {
+            if (success) console.log(`Discord batch sent: ${batch.length} embeds`);
+            return success;
+          })
+      );
+      
+      // Small delay between batches to avoid rate limits
+      if (i + DISCORD_MAX_EMBEDS < discordEmbeds.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+  }
+  
+  // Slack: Send each item (Slack doesn't support batching the same way)
+  if (settings.enableSlack && settings.slackWebhookUrl) {
+    for (const item of items) {
+      const payload = buildSlackItemPayload(item, gifUrl);
+      notifications.push(
+        sendSlackNotification(settings.slackWebhookUrl, payload)
+          .then(success => {
+            if (success) console.log(`Slack notification sent: ${item.id}`);
+            return success;
+          })
+      );
+      // Small delay for Slack rate limiting
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
+  
+  if (notifications.length > 0) {
+    await Promise.all(notifications);
+  }
+}
+
+/*
+ * =============================================================================
+ * CACHING FUNCTIONS
+ * =============================================================================
+ */
+
+/**
+ * Get parent post title with caching
+ */
+async function getCachedPostTitle(
+  context: TriggerContext | Devvit.Context,
+  postId: string
+): Promise<string> {
+  if (!postId) return 'Unknown Post';
+  
+  const { redis } = context;
+  const cacheKey = `${RedisKeys.POST_TITLE_PREFIX}${postId}`;
+  
+  try {
+    // Check cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    
+    // Fetch from API
+    const post = await context.reddit.getPostById(postId);
+    const title = post.title || 'Unknown Post';
+    
+    // Cache for 1 hour
+    await redis.set(cacheKey, title, { 
+      expiration: new Date(Date.now() + CacheTTL.POST_TITLE) 
+    });
+    
+    return title;
+  } catch (error) {
+    console.warn(`QBert: Could not fetch post title for ${postId}:`, error);
+    return 'Unknown Post';
+  }
+}
+
+/**
+ * Get cached GIF URL (fetch once per batch interval)
+ */
+async function getCachedGif(
+  context: TriggerContext | Devvit.Context
+): Promise<string> {
+  const { redis } = context;
+  
+  try {
+    // Check cache first
+    const cached = await redis.get(RedisKeys.CACHED_GIF);
+    if (cached) {
+      return cached;
+    }
+    
+    // Fetch new GIF
+    const gifUrl = await fetchGiphyGif(context);
+    
+    // Cache for 5 minutes
+    await redis.set(RedisKeys.CACHED_GIF, gifUrl, { 
+      expiration: new Date(Date.now() + CacheTTL.GIF) 
+    });
+    
+    return gifUrl;
+  } catch (error) {
+    console.error('QBert: Error getting cached GIF:', error);
+    return FALLBACK_GIF_URL;
+  }
+}
+
+/*
+ * =============================================================================
+ * REDIS BATCH OPERATIONS
+ * =============================================================================
+ */
+
+/**
+ * Batch check if items are processed (concurrent Redis calls)
+ */
+async function batchCheckProcessed(
+  context: TriggerContext | Devvit.Context,
+  itemIds: string[]
+): Promise<boolean[]> {
+  const { redis } = context;
+  
+  try {
+    // Use Promise.all for concurrent Redis operations
+    const checks = itemIds.map(id => 
+      redis.get(`${RedisKeys.PROCESSED_PREFIX}${id}`)
+        .then(value => value !== null)
+        .catch(() => false)
+    );
+    
+    return await Promise.all(checks);
+  } catch (error) {
+    console.error('QBert: Error batch checking processed items:', error);
+    return itemIds.map(() => false);
+  }
+}
+
+/**
+ * Check if an item has already been processed
+ */
+async function isItemProcessed(
+  context: TriggerContext | Devvit.Context,
+  itemId: string
+): Promise<boolean> {
+  const { redis } = context;
+  try {
+    const key = `${RedisKeys.PROCESSED_PREFIX}${itemId}`;
+    const value = await redis.get(key);
+    return value !== null;
+  } catch (error) {
+    console.error(`Error checking if item ${itemId} is processed:`, error);
+    return false;
+  }
+}
+
+/**
+ * Mark an item as processed
+ */
+async function markItemProcessed(
+  context: TriggerContext | Devvit.Context,
+  itemId: string
+): Promise<void> {
+  const { redis } = context;
+  try {
+    const key = `${RedisKeys.PROCESSED_PREFIX}${itemId}`;
+    await redis.set(key, '1', { 
+      expiration: new Date(Date.now() + CacheTTL.PROCESSED_ITEM) 
+    });
+  } catch (error) {
+    console.error(`Error marking item ${itemId} as processed:`, error);
+  }
+}
+
+/*
+ * =============================================================================
+ * OVERFLOW ALERT
+ * =============================================================================
+ */
+
+/**
+ * Send overflow alert if not on cooldown
+ */
+async function sendOverflowAlertIfNeeded(
+  context: TriggerContext | Devvit.Context,
+  settings: NotificationSettings,
+  itemCount: number
+): Promise<void> {
+  const { redis } = context;
+  
+  try {
+    const lastAlert = await redis.get(RedisKeys.LAST_OVERFLOW_ALERT);
+    const now = Date.now();
+    
+    if (lastAlert && parseInt(lastAlert, 10) > now - CacheTTL.OVERFLOW_COOLDOWN) {
+      return; // Still on cooldown
+    }
+    
+    const overflowData: OverflowAlertData = {
+      itemCount,
+      discordRoleId: settings.discordRoleId,
+    };
+    
+    const success = await sendOverflowNotifications(settings, overflowData);
+    
+    if (success) {
+      await redis.set(RedisKeys.LAST_OVERFLOW_ALERT, now.toString(), {
+        expiration: new Date(now + CacheTTL.OVERFLOW_COOLDOWN)
+      });
+      console.log(`QBert: Sent overflow alert for ${itemCount} items`);
+    }
+  } catch (error) {
+    console.error('QBert: Error sending overflow alert:', error);
+  }
+}
+
+/*
+ * =============================================================================
+ * WEBHOOK FUNCTIONS
  * =============================================================================
  */
 
@@ -561,7 +1026,6 @@ async function sendDiscordNotification(
     return false;
   }
 
-  // Add bot identity to payload (like BanBunny pattern)
   const fullPayload: DiscordWebhookPayload = {
     username: DISCORD_BOT_USERNAME,
     avatar_url: DISCORD_BOT_AVATAR,
@@ -583,7 +1047,6 @@ async function sendDiscordNotification(
         return true;
       }
 
-      // If rate limited, wait longer before retry
       if (response.status === 429) {
         const retryAfter = response.headers.get('retry-after');
         const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : Math.pow(2, attempt) * 1000;
@@ -592,12 +1055,11 @@ async function sendDiscordNotification(
         continue;
       }
 
-      // For other errors, log and retry with exponential backoff
       const errorText = await response.text().catch(() => 'Unknown error');
       lastError = new Error(`Discord webhook returned ${response.status}: ${errorText}`);
       
       if (attempt < maxRetries - 1) {
-        const waitTime = Math.pow(2, attempt) * 1000; // Exponential backoff: 1s, 2s, 4s
+        const waitTime = Math.pow(2, attempt) * 1000;
         console.warn(`Discord webhook failed, retrying in ${waitTime}ms (attempt ${attempt + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, waitTime));
       }
@@ -605,7 +1067,7 @@ async function sendDiscordNotification(
       lastError = error instanceof Error ? error : new Error(String(error));
       
       if (attempt < maxRetries - 1) {
-        const waitTime = Math.pow(2, attempt) * 1000; // Exponential backoff
+        const waitTime = Math.pow(2, attempt) * 1000;
         console.warn(`Discord webhook error, retrying in ${waitTime}ms (attempt ${attempt + 1}/${maxRetries}):`, lastError.message);
         await new Promise(resolve => setTimeout(resolve, waitTime));
       }
@@ -645,6 +1107,50 @@ async function sendSlackNotification(
     console.error('Error sending Slack notification:', error);
     return false;
   }
+}
+
+/*
+ * =============================================================================
+ * PAYLOAD BUILDERS
+ * =============================================================================
+ */
+
+/**
+ * Build a Discord embed from item data
+ */
+function buildDiscordItemEmbed(item: ModQueueItemData, gifUrl: string): DiscordEmbed {
+  const isSubmission = item.type === 'submission';
+  const color = item.isStale 
+    ? DiscordColors.RED 
+    : (isSubmission ? DiscordColors.GREEN : DiscordColors.BLUE);
+  
+  let title: string;
+  let description: string;
+  
+  if (isSubmission) {
+    title = item.title;
+    if (item.isStale) {
+      description = `There is a Stale Post in the ModQueue from ${item.author}!\nPost has been waiting since ${item.createdAt.toISOString()}`;
+    } else {
+      description = `New Post in the ModQueue from ${item.author}!`;
+    }
+  } else {
+    title = `${item.author} has commented on "${item.parentPostTitle}"`;
+    if (item.isStale) {
+      description = `There is a Stale Comment in the ModQueue from ${item.author}!\nComment has been waiting since ${item.createdAt.toISOString()}`;
+    } else {
+      description = 'New comment in the ModQueue!';
+    }
+  }
+
+  return {
+    title,
+    description,
+    url: item.url,
+    color,
+    timestamp: new Date().toISOString(),
+    thumbnail: { url: gifUrl },
+  };
 }
 
 /**
@@ -722,6 +1228,18 @@ function buildSlackItemPayload(
 }
 
 /**
+ * Build a Discord embed for overflow alert
+ */
+function buildOverflowEmbed(itemCount: number): DiscordEmbed {
+  return {
+    title: "You had one job! Stop shootin' the shit and check the damn queue!",
+    description: `There are ${itemCount} items in the queue!!!`,
+    color: DiscordColors.DARK_MAGENTA,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
  * Build a Slack Block Kit payload for overflow alerts
  */
 function buildSlackOverflowPayload(data: OverflowAlertData): SlackWebhookPayload {
@@ -761,61 +1279,6 @@ function buildSlackOverflowPayload(data: OverflowAlertData): SlackWebhookPayload
   };
 }
 
-// Settings interface for notification configuration
-interface NotificationSettings {
-  enableDiscord: boolean;
-  discordWebhookUrl?: string;
-  discordRoleId?: string;
-  enableSlack: boolean;
-  slackWebhookUrl?: string;
-}
-
-/**
- * Send notifications to all enabled platforms (Discord and Slack)
- */
-async function sendItemNotifications(
-  context: TriggerContext | Devvit.Context,
-  settings: NotificationSettings,
-  item: ModQueueItemData
-): Promise<void> {
-  // Fetch GIF once for both notifications
-  const gifUrl = await fetchGiphyGif(context);
-  
-  const notifications: Promise<boolean>[] = [];
-  
-  // Discord notification
-  if (settings.enableDiscord && settings.discordWebhookUrl) {
-    const discordEmbed = buildDiscordItemEmbed(item, gifUrl);
-    const discordPayload: DiscordWebhookPayload = {
-      embeds: [discordEmbed],
-    };
-    notifications.push(
-      sendDiscordNotification(settings.discordWebhookUrl, discordPayload)
-        .then(success => {
-          if (success) console.log(`Discord notification sent for: ${item.id}`);
-          return success;
-        })
-    );
-  }
-  
-  // Slack notification
-  if (settings.enableSlack && settings.slackWebhookUrl) {
-    const slackPayload = buildSlackItemPayload(item, gifUrl);
-    notifications.push(
-      sendSlackNotification(settings.slackWebhookUrl, slackPayload)
-        .then(success => {
-          if (success) console.log(`Slack notification sent for: ${item.id}`);
-          return success;
-        })
-    );
-  }
-  
-  // Send to all platforms concurrently
-  if (notifications.length > 0) {
-    await Promise.all(notifications);
-  }
-}
-
 /**
  * Send overflow alert to all enabled platforms
  */
@@ -825,7 +1288,6 @@ async function sendOverflowNotifications(
 ): Promise<boolean> {
   const notifications: Promise<boolean>[] = [];
   
-  // Discord notification
   if (settings.enableDiscord && settings.discordWebhookUrl) {
     const discordEmbed = buildOverflowEmbed(data.itemCount);
     const discordPayload: DiscordWebhookPayload = {
@@ -835,7 +1297,6 @@ async function sendOverflowNotifications(
     notifications.push(sendDiscordNotification(settings.discordWebhookUrl, discordPayload));
   }
   
-  // Slack notification
   if (settings.enableSlack && settings.slackWebhookUrl) {
     const slackPayload = buildSlackOverflowPayload(data);
     notifications.push(sendSlackNotification(settings.slackWebhookUrl, slackPayload));
@@ -845,87 +1306,17 @@ async function sendOverflowNotifications(
     return false;
   }
   
-  // Send to all platforms concurrently
   const results = await Promise.all(notifications);
-  return results.some(success => success);  // Return true if at least one succeeded
+  return results.some(success => success);
 }
 
-/**
- * Build a Discord embed from unified item data
+/*
+ * =============================================================================
+ * UTILITY FUNCTIONS
+ * =============================================================================
  */
-function buildDiscordItemEmbed(item: ModQueueItemData, gifUrl: string): DiscordEmbed {
-  const isSubmission = item.type === 'submission';
-  const color = item.isStale 
-    ? DiscordColors.RED 
-    : (isSubmission ? DiscordColors.GREEN : DiscordColors.BLUE);
-  
-  let title: string;
-  let description: string;
-  
-  if (isSubmission) {
-    title = item.title;
-    if (item.isStale) {
-      description = `There is a Stale Post in the ModQueue from ${item.author}!\nPost has been waiting since ${item.createdAt.toISOString()}`;
-    } else {
-      description = `New Post in the ModQueue from ${item.author}!`;
-    }
-  } else {
-    title = `${item.author} has commented on "${item.parentPostTitle}"`;
-    if (item.isStale) {
-      description = `There is a Stale Comment in the ModQueue from ${item.author}!\nComment has been waiting since ${item.createdAt.toISOString()}`;
-    } else {
-      description = 'New comment in the ModQueue!';
-    }
-  }
 
-  return {
-    title,
-    description,
-    url: item.url,
-    color,
-    timestamp: new Date().toISOString(),
-    thumbnail: { url: gifUrl },
-  };
-}
-
-/**
- * Check if an item has already been processed
- */
-async function isItemProcessed(
-  context: TriggerContext | Devvit.Context,
-  itemId: string
-): Promise<boolean> {
-  const { redis } = context;
-  try {
-    const key = `processed:${itemId}`;
-    const value = await redis.get(key);
-    return value !== null;
-  } catch (error) {
-    console.error(`Error checking if item ${itemId} is processed:`, error);
-    // Return false on error to allow processing (fail open)
-    return false;
-  }
-}
-
-/**
- * Mark an item as processed
- */
-async function markItemProcessed(
-  context: TriggerContext | Devvit.Context,
-  itemId: string
-): Promise<void> {
-  const { redis } = context;
-  try {
-    const key = `processed:${itemId}`;
-    const ttlMilliseconds = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
-    await redis.set(key, '1', { expiration: new Date(Date.now() + ttlMilliseconds) });
-  } catch (error) {
-    console.error(`Error marking item ${itemId} as processed:`, error);
-    // Don't throw - allow processing to continue
-  }
-}
-
-// Default fallback GIF if Giphy API fails or is not configured
+// Default fallback GIF
 const FALLBACK_GIF_URL = 'https://media.giphy.com/media/tXL4FHPSnVJ0A/giphy.gif';
 
 /**
@@ -943,7 +1334,6 @@ async function fetchGiphyGif(
       return FALLBACK_GIF_URL;
     }
 
-    // Use random endpoint with tag for better variety (matching BanBunny pattern)
     const response = await fetch(
       `https://api.giphy.com/v1/gifs/random?api_key=${apiKey}&tag=waiting+in+line&rating=pg`
     );
@@ -954,8 +1344,6 @@ async function fetchGiphyGif(
     }
 
     const data = await response.json();
-    
-    // Random endpoint returns data.data as an object
     return data.data?.images?.original?.url || FALLBACK_GIF_URL;
   } catch (error) {
     console.error('Error fetching Giphy:', error);
@@ -972,18 +1360,6 @@ function isItemStale(itemCreatedAt: Date, thresholdMinutes: number): boolean {
   return ageMinutes > thresholdMinutes;
 }
 
-/**
- * Build a Discord embed for a queue overflow alert
- */
-function buildOverflowEmbed(itemCount: number): DiscordEmbed {
-  return {
-    title: "You had one job! Stop shootin' the shit and check the damn queue!",
-    description: `There are ${itemCount} items in the queue!!!`,
-    color: DiscordColors.DARK_MAGENTA,
-    timestamp: new Date().toISOString(),
-  };
-}
-
 /*
  * =============================================================================
  * EXPORT
@@ -991,4 +1367,3 @@ function buildOverflowEmbed(itemCount: number): DiscordEmbed {
  */
 
 export default Devvit;
-

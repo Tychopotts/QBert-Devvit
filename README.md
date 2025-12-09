@@ -68,10 +68,12 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 
 | Type | Discord | Slack | Trigger |
 |------|---------|-------|---------|
-| New Submission | 🟢 Green embed | 📥 Header | Post enters mod queue |
-| New Comment | 🔵 Blue embed | 💬 Header | Comment enters mod queue |
-| Stale Item | 🔴 Red embed | 🚨 Header | Item waiting > threshold |
-| Queue Overflow | 🟣 Purple embed | 🚨 Header | Queue size > threshold |
+| New Submission | 🟢 Green embed (`#57F287`) | 📥 Header | Post enters mod queue |
+| New Comment | 🔵 Blue embed (`#3498DB`) | 💬 Header | Comment enters mod queue |
+| Stale Item | 🔴 Red embed (`#ED4245`) | 🚨 Header | Item waiting > threshold |
+| Queue Overflow | 🟣 Purple embed (`#9B59B6`) | 🚨 Header | Queue size > threshold |
+
+> **Note:** These colors use Discord's standard palette. While red/green may be difficult for users with red-green colorblindness, all notifications include descriptive text labels and Slack uses emoji indicators for accessibility.
 
 ## Architecture
 
