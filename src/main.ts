@@ -5,13 +5,14 @@
  * See REQUIREMENTS.md for full business requirements.
  */
 
-import { Devvit } from '@devvit/public-api';
+import { Devvit, Post, Comment } from '@devvit/public-api';
 
-// Enable Redis for state management
+// Enable required Devvit features
 Devvit.configure({
   redditAPI: true,
   redis: true,
   http: true, // Required for Discord webhook calls
+  scheduler: true, // Required for scheduled jobs
 });
 
 /*
@@ -157,19 +158,28 @@ Devvit.addSchedulerJob({
         return;
       }
 
-      const subredditName = event.subredditName || event.data?.subredditName;
+      // Get subreddit name from event data
+      const subredditName = event.data?.subredditName as string | undefined;
       if (!subredditName) {
-        console.error('QBert: Subreddit name not found in event');
+        console.error('QBert: Subreddit name not found in event data');
         return;
       }
 
       // Step 2: Fetch Mod Queue
-      let queueItems;
+      let queueItems: (Post | Comment)[];
       try {
-        queueItems = await context.reddit.getModQueue({
-          subredditName,
-          limit: 100, // Get up to 100 items
+        // Get the subreddit object first
+        const subreddit = await context.reddit.getSubredditByName(subredditName);
+        
+        // Get mod queue from subreddit (returns a Listing)
+        const modQueueListing = await subreddit.getModQueue({ 
+          type: 'all',
+          limit: 100,
+          pageSize: 100
         });
+        
+        // Convert Listing to array
+        queueItems = await modQueueListing.all();
       } catch (error) {
         console.error('QBert: Error fetching mod queue:', error);
         return;
@@ -201,9 +211,9 @@ Devvit.addSchedulerJob({
             continue;
           }
 
-          // Step 4: Classify Item
-          const isSubmission = itemId.startsWith('t3_');
-          const isComment = itemId.startsWith('t1_');
+          // Step 4: Classify Item (based on TypeScript type)
+          const isSubmission = item instanceof Post;
+          const isComment = item instanceof Comment;
 
           if (!isSubmission && !isComment) {
             console.warn(`QBert: Unknown item type for ${itemId}, skipping`);
@@ -211,22 +221,8 @@ Devvit.addSchedulerJob({
             continue;
           }
 
-          // Get creation time - handle different possible property names
-          let itemCreatedAt: Date;
-          if ('createdAt' in item && item.createdAt) {
-            // Devvit API might return Unix timestamp (seconds) or Date
-            const timestamp = typeof item.createdAt === 'number' 
-              ? item.createdAt * 1000 
-              : item.createdAt;
-            itemCreatedAt = new Date(timestamp);
-          } else if ('created_utc' in item && item.created_utc) {
-            itemCreatedAt = new Date((item.created_utc as number) * 1000);
-          } else {
-            // Fallback to current time if we can't determine creation time
-            console.warn(`QBert: Could not determine creation time for ${itemId}, using current time`);
-            itemCreatedAt = new Date();
-          }
-          
+          // Get creation time from the item
+          const itemCreatedAt = item.createdAt;
           const stale = isItemStale(itemCreatedAt, staleThresholdMinutes);
 
           // Determine if we should send notification
@@ -254,16 +250,15 @@ Devvit.addSchedulerJob({
             let embed: DiscordEmbed;
 
             if (isSubmission) {
-              const postTitle = 'title' in item ? String(item.title) : 'Untitled Post';
-              const author = 'author' in item ? String(item.author) : 'Unknown';
-              const url = `https://reddit.com${'permalink' in item ? item.permalink : `/r/${subredditName}/comments/${itemId.replace('t3_', '')}`}`;
+              const post = item as Post;
+              const url = `https://reddit.com${post.permalink}`;
               
               embed = await buildSubmissionEmbed(
                 context.http,
                 {
                   id: itemId,
-                  title: postTitle,
-                  author,
+                  title: post.title,
+                  author: post.authorName,
                   url,
                   createdAt: itemCreatedAt,
                 },
@@ -272,22 +267,23 @@ Devvit.addSchedulerJob({
               );
             } else {
               // Comment
-              const author = 'author' in item ? String(item.author) : 'Unknown';
-              const url = `https://reddit.com${'permalink' in item ? item.permalink : `/r/${subredditName}/comments/${itemId.replace('t1_', '')}`}`;
+              const comment = item as Comment;
+              const url = `https://reddit.com${comment.permalink}`;
               
-              // Try to get parent post title
+              // Fetch parent post to get title
               let parentPostTitle = 'Unknown Post';
-              if ('linkTitle' in item && item.linkTitle) {
-                parentPostTitle = String(item.linkTitle);
-              } else if ('parentTitle' in item && item.parentTitle) {
-                parentPostTitle = String(item.parentTitle);
+              try {
+                const parentPost = await context.reddit.getPostById(comment.postId);
+                parentPostTitle = parentPost.title;
+              } catch (error) {
+                console.warn(`QBert: Could not fetch parent post for comment ${itemId}:`, error);
               }
 
               embed = await buildCommentEmbed(
                 context.http,
                 {
                   id: itemId,
-                  author,
+                  author: comment.authorName,
                   url,
                   createdAt: itemCreatedAt,
                   parentPostTitle,
@@ -368,26 +364,59 @@ Devvit.addSchedulerJob({
  * =============================================================================
  */
 
+/**
+ * Helper function to schedule or reschedule the mod queue check job
+ */
+async function scheduleModQueueCheck(context: Devvit.Context): Promise<void> {
+  const settings = await context.settings.getAll();
+  const intervalMinutes = (settings.checkIntervalMinutes as number) || 15;
+  
+  // Validate interval (must be between 1 and 60 minutes)
+  const validInterval = Math.max(1, Math.min(60, intervalMinutes));
+  
+  // Get current subreddit name
+  const subredditName = await context.reddit.getCurrentSubredditName();
+  
+  // Cancel any existing jobs first
+  const existingJobs = await context.scheduler.listJobs();
+  for (const job of existingJobs) {
+    if (job.name === 'checkModQueue') {
+      await context.scheduler.cancelJob(job.id);
+    }
+  }
+  
+  // Schedule the recurring job with subreddit name in data
+  await context.scheduler.runJob({
+    name: 'checkModQueue',
+    cron: `*/${validInterval} * * * *`, // Every N minutes
+    data: { subredditName }, // Pass subreddit name to job
+  });
+  
+  console.log(`QBert: Scheduled mod queue checks for r/${subredditName} every ${validInterval} minutes.`);
+}
+
 Devvit.addTrigger({
   event: 'AppInstall',
   onEvent: async (event, context) => {
     try {
-      const settings = await context.settings.getAll();
-      const intervalMinutes = (settings.checkIntervalMinutes as number) || 15;
-      
-      // Validate interval (must be between 1 and 60 minutes)
-      const validInterval = Math.max(1, Math.min(60, intervalMinutes));
-      
-      // Schedule the recurring job
-      await context.scheduler.runJob({
-        name: 'checkModQueue',
-        cron: `*/${validInterval} * * * *`, // Every N minutes
-      });
-      
-      console.log(`QBert installed! Checking mod queue every ${validInterval} minutes.`);
+      await scheduleModQueueCheck(context);
+      const subredditName = await context.reddit.getCurrentSubredditName();
+      console.log(`QBert installed on r/${subredditName}!`);
     } catch (error) {
       console.error('QBert: Error during app installation:', error);
       // Don't throw - allow installation to complete
+    }
+  },
+});
+
+Devvit.addTrigger({
+  events: ['AppUpgrade'],
+  onEvent: async (event, context) => {
+    try {
+      await scheduleModQueueCheck(context);
+      console.log('QBert: App upgraded and scheduler updated.');
+    } catch (error) {
+      console.error('QBert: Error during app upgrade:', error);
     }
   },
 });
@@ -500,7 +529,7 @@ async function markItemProcessed(
 }
 
 /**
- * Fetch a GIF from Giphy API
+ * Fetch a random GIF from Giphy API
  * See REQUIREMENTS.md - FR-7: Giphy Integration
  */
 async function fetchGiphyGif(
@@ -512,8 +541,9 @@ async function fetchGiphyGif(
   }
 
   try {
-    const searchQuery = encodeURIComponent('waiting in line');
-    const url = `https://api.giphy.com/v1/gifs/search?api_key=${apiKey}&q=${searchQuery}&limit=1&rating=g`;
+    // Use random endpoint with tag for better variety
+    const tag = encodeURIComponent('waiting in line');
+    const url = `https://api.giphy.com/v1/gifs/random?api_key=${apiKey}&tag=${tag}&rating=g`;
     
     const response = await http.fetch(url, {
       method: 'GET',
@@ -526,8 +556,9 @@ async function fetchGiphyGif(
 
     const data = await response.json();
     
-    if (data.data && data.data.length > 0) {
-      const gifUrl = data.data[0].images?.original?.url || data.data[0].images?.downsized?.url;
+    // Random endpoint returns data.data as an object, not an array
+    if (data.data) {
+      const gifUrl = data.data.images?.original?.url || data.data.images?.downsized?.url;
       return gifUrl || null;
     }
 
