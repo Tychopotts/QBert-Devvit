@@ -46,7 +46,19 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 
 **General Settings:**
 - **Giphy API Key** (optional) — Get from developers.giphy.com for GIF attachments
-- **Check Interval** in minutes (default: 15) — How often to check the mod queue
+- **Backup Check Interval** in minutes (default: 30) — Fallback scheduler for catching missed items
+- **Notification Batch Interval** in seconds (default: 30) — How often to flush queued notifications
+
+### Recommended Settings by Subreddit Size
+
+| Subreddit Size | Members | Backup Interval | Batch Interval | Notes |
+|----------------|---------|-----------------|----------------|-------|
+| **Small** | < 50k | 60 min | 60-120 sec | Low traffic; defaults work fine |
+| **Medium** | 50k - 500k | 30 min | 30-60 sec | Moderate activity |
+| **Large** | 500k - 2M | 15-20 min | 15-30 sec | High volume; batch helps avoid rate limits |
+| **Very Large** | 2M+ | 15 min | 15 sec | Maximum responsiveness |
+
+> **How it works:** QBert uses event-driven triggers for near-instant detection when items enter the mod queue. The backup interval is a safety net that catches anything the event triggers might miss. The batch interval groups multiple notifications together to avoid Discord/Slack rate limits on high-volume subreddits.
 
 **Discord Settings:**
 - **Enable Discord Notifications** — Toggle Discord notifications on/off
@@ -60,6 +72,13 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 **Threshold Settings:**
 - **Stale Threshold** in minutes (default: 45) — How long before items are marked as stale
 - **Overflow Threshold** item count (default: 5) — Queue size that triggers overflow alert
+
+| Subreddit Size | Stale Threshold | Overflow Threshold | Reasoning |
+|----------------|-----------------|--------------------|-----------| 
+| Small | 60-120 min | 3-5 items | Lower volume = more time before concern |
+| Medium | 30-60 min | 5-10 items | Balance responsiveness with noise |
+| Large | 15-45 min | 10-25 items | Higher baseline queue is normal |
+| Very Large | 15-30 min | 25-50 items | Fast-moving queue; adjust to your team size |
 
 **Notification Toggles:**
 - Enable/disable notifications for submissions, comments, stale alerts, and overflow alerts
