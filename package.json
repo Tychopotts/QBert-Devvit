@@ -1,7 +1,7 @@
 {
   "name": "qbert-devvit",
   "version": "0.0.1",
-  "description": "Discord notification bot for Reddit moderation queues - Devvit Edition",
+  "description": "Discord and Slack notification bot for Reddit moderation queues",
   "type": "module",
   "main": "src/main.ts",
   "scripts": {
@@ -10,20 +10,21 @@
     "upload": "devvit upload"
   },
   "dependencies": {
-    "@devvit/public-api": "latest"
+    "@devvit/public-api": "0.12.5"
   },
   "devDependencies": {
-    "@devvit/tsconfig": "latest",
+    "@devvit/tsconfig": "0.12.5",
     "typescript": "^5.0.0"
   },
   "keywords": [
     "devvit",
     "reddit",
     "discord",
+    "slack",
     "moderation",
     "webhook"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "BSD-3-Clause",
+  "private": true
 }
-
