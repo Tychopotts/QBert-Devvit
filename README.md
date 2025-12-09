@@ -20,7 +20,6 @@ This project is a reimplementation of [QBert](https://github.com/GoddessOfTest/q
 
 ## Documentation
 
-- [Business Requirements](REQUIREMENTS.md) — Complete functional and non-functional requirements
 - [Privacy Policy](Privacy-Policy.md) — Data collection and usage information
 - [Devvit Docs](https://developers.reddit.com/docs/) — Official platform documentation
 

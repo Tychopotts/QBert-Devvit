@@ -12,7 +12,6 @@ Devvit.configure({
 
 // ============================================================================
 // App Settings - Configured per subreddit installation
-// See REQUIREMENTS.md - Configuration Settings Schema
 // ============================================================================
 
 Devvit.addSettings([
@@ -552,7 +551,6 @@ Devvit.addTrigger({
 
 /**
  * Send a Discord webhook notification
- * See REQUIREMENTS.md - FR-5: Discord Notifications
  */
 async function sendDiscordNotification(
   webhookUrl: string,
@@ -976,7 +974,6 @@ function isItemStale(itemCreatedAt: Date, thresholdMinutes: number): boolean {
 
 /**
  * Build a Discord embed for a queue overflow alert
- * See REQUIREMENTS.md - Notification Message Templates
  */
 function buildOverflowEmbed(itemCount: number): DiscordEmbed {
   return {
