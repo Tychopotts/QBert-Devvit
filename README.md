@@ -1,10 +1,10 @@
-# QBert-Devvit
+# QueueBert aka QBert-Devvit
 
 A Reddit Devvit application that monitors subreddit moderation queues and sends real-time notifications to Discord and Slack.
 
 ## Overview
 
-QBert-Devvit is a native Reddit application built on the [Devvit platform](https://developers.reddit.com/docs/) that bridges Reddit moderation workflows with Discord and Slack. When items enter your subreddit's moderation queue, moderators receive instant notifications with details about the pending content.
+QueueBert is a native Reddit application built on the [Devvit platform](https://developers.reddit.com/docs/) that bridges Reddit moderation workflows with Discord and Slack. When items enter your subreddit's moderation queue, moderators receive instant notifications with details about the pending content.
 
 This project is a reimplementation of [QBert](https://github.com/GoddessOfTest/qbert) (originally a .NET application) as a Devvit app, eliminating the need for self-hosting while gaining native Reddit API access.
 
@@ -20,13 +20,13 @@ This project is a reimplementation of [QBert](https://github.com/GoddessOfTest/q
 
 ## Documentation
 
-- [Privacy Policy](Privacy-Policy.md) — Data collection and usage information
+- [Privacy Policy](https://github.com/Tychopotts/QBert-Devvit/blob/main/Privacy-Policy.md) — Data collection and usage information
 - [Devvit Docs](https://developers.reddit.com/docs/) — Official platform documentation
 
 ## Latest Update
 
 - Added Slack as an integration endpoint
-- We have an [icon!](icon.png)
+- We have an [icon!](https://github.com/Tychopotts/QBert-Devvit/blob/main/icon.png)
 
 ## Getting Started
 
@@ -58,7 +58,7 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 | **Large** | 500k - 2M | 15-20 min | 15-30 sec | High volume; batch helps avoid rate limits |
 | **Very Large** | 2M+ | 15 min | 15 sec | Maximum responsiveness |
 
-> **How it works:** QBert uses event-driven triggers for near-instant detection when items enter the mod queue. The backup interval is a safety net that catches anything the event triggers might miss. The batch interval groups multiple notifications together to avoid Discord/Slack rate limits on high-volume subreddits.
+> **How it works:** QueueBert uses event-driven triggers for near-instant detection when items enter the mod queue. The backup interval is a safety net that catches anything the event triggers might miss. The batch interval groups multiple notifications together to avoid Discord/Slack rate limits on high-volume subreddits.
 
 **Discord Settings:**
 - **Enable Discord Notifications** — Toggle Discord notifications on/off
@@ -96,22 +96,7 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 
 ## Architecture
 
-```
-                                        ┌─────────────┐
-                                   ┌───▶│   Discord   │
-                                   │    │   Webhook   │
-┌─────────────┐     ┌─────────────┐│    └─────────────┘
-│   Devvit    │────▶│    QBert    │┤
-│  Scheduler  │     │   (main.ts) ││    ┌─────────────┐
-└─────────────┘     └─────────────┘└───▶│    Slack    │
-                          │             │   Webhook   │
-                    ┌─────┴─────┐       └─────────────┘
-                    ▼           ▼
-              ┌──────────┐ ┌──────────┐
-              │  Reddit  │ │  Redis   │
-              │  Mod API │ │ Storage  │
-              └──────────┘ └──────────┘
-```
+![Architecture](https://i.imgur.com/horm4Hr.png)
 
 ## Technical Details
 
@@ -155,9 +140,11 @@ After installing the app on your subreddit, configure it through Reddit's mod to
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](https://github.com/Tychopotts/QBert-Devvit/blob/main/LICENSE) for details.
 
 ## Related
 
-- [Original QBert (.NET)](https://github.com/GoddessOfTest/qbert) — The original implementation
+- [Original QueueBert (.NET)](https://github.com/GoddessOfTest/qbert) — The original implementation
 - [Devvit Mod Tools Guide](https://developers.reddit.com/docs/introduction/intro-mod-tools)
+
+![Powered By GIPHY](https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExcjFhamI0ZGt1amthbWYyanl1cnJwY2YzMHZodjVra3duZm5taWJ3MSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/1cfwIqOjbl6hMCFFPM/giphy.gif)

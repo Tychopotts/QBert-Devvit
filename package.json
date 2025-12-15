@@ -10,11 +10,12 @@
     "upload": "devvit upload"
   },
   "dependencies": {
-    "@devvit/public-api": "0.12.5"
+    "@devvit/public-api": "0.12.6"
   },
   "devDependencies": {
-    "@devvit/tsconfig": "0.12.5",
-    "typescript": "^5.0.0"
+    "@devvit/tsconfig": "0.12.6",
+    "devvit": "^1.0.0",
+    "typescript": "5.8.3"
   },
   "keywords": [
     "devvit",
